@@ -70,6 +70,7 @@ typedef struct VideoPicture {
     double pts;
 } VideoPicture;
 
+
 typedef struct VideoState {
     AVFormatContext *pFormatCtx;
     int             videoStream, audioStream;
@@ -112,6 +113,12 @@ typedef struct VideoState {
     SDL_Thread      *parse_tid;
     SDL_Thread      *video_tid;
 
+    SDL_Thread      *scale_to_rgb_tid;
+    SDL_Thread      *scale_to_yuv_tid;
+
+    PacketQueue     yuv_to_rgbq;
+    PacketQueue     rgb_to_yuvq;
+    PacketQueue     yuv_to_displayq;
     char            filename[1024];
     int             quit;
 
@@ -143,10 +150,31 @@ typedef enum {
     SELECTION_NONE,
     SELECTION_BW,
     SELECTION_COLOR,
-    SELECTION_BLUE
+    SELECTION_BLUE,
+    SELECTION_RED,
+    SELECTION_GREEN
 }selection_e;
 
+typedef enum {
+    SCALE_RGB_TO_YUV,
+    SCALE_YUV_TO_RGB
+}scale_e;
+
 selection_e g_color_selection = SELECTION_NONE;
+
+typedef struct {
+    selection_e selection;
+    AVFrame *frame;
+    AVPicture *pict;
+    int dest_format;
+} ColorPacket;
+
+typedef struct {
+    VideoState *is;
+    PacketQueue *my_queue;
+    PacketQueue *next_queue;
+    scale_e scale;
+} scale_thread_args_t;
 
 SDL_Surface     *screen;
 
@@ -154,6 +182,8 @@ SDL_Surface     *screen;
    can be global in case we need it. */
 VideoState *global_video_state;
 AVPacket flush_pkt;
+
+static int scale_thread(void *arg);
 
 void packet_queue_init(PacketQueue *q) {
     memset(q, 0, sizeof(PacketQueue));
@@ -935,29 +965,47 @@ int queue_picture(VideoState *is, AVFrame *pFrame, double pts) {
         pict.linesize[0] = vp->bmp->pitches[0];
         pict.linesize[1] = vp->bmp->pitches[2];
         pict.linesize[2] = vp->bmp->pitches[1];
-        if(g_color_selection == SELECTION_BLUE)
-        {
-            remove_color(is, pFrame, &pict, g_color_selection);
-        }
-        else
-        {
-            // Convert the image into YUV format that SDL uses
-            sws_scale
-                (
-                 is->sws_ctx,
-                 (uint8_t const * const *)pFrame->data,
-                 pFrame->linesize,
-                 0,
-                 is->video_st->codec->height,
-                 pict.data,
-                 pict.linesize
-                );
-        }
 
-        if(g_color_selection == SELECTION_BW)
+AVPacket color_pkt;
+        switch (g_color_selection)
         {
-            memset(pict.data[1], 128, ((vp->width / 2) * (vp->height / 2)));
-            memset(pict.data[2], 128, ((vp->width / 2) * (vp->height / 2)));
+            case SELECTION_BLUE:
+                remove_color(is, pFrame, &pict, g_color_selection);
+                break;
+
+            case SELECTION_RED:
+            case SELECTION_GREEN:
+                packet_queue_init(&color_pkt);
+                ColorPacket *pkt_data = (ColorPacket*)av_malloc(sizeof(ColorPacket));
+                pkt_data->selection = g_color_selection;
+                pkt_data->frame = pFrame;
+                                pkt_data->pict = pict;
+                color_pkt.data = pkt_data;
+                packet_queue_put(&is->rgb_to_yuvq, &color_pkt);
+                break;
+
+
+            case SELECTION_BW:
+            default:
+                // Convert the image into YUV format that SDL uses
+                sws_scale
+                    (
+                     is->sws_ctx,
+                     (uint8_t const * const *)pFrame->data,
+                     pFrame->linesize,
+                     0,
+                     is->video_st->codec->height,
+                     pict.data,
+                     pict.linesize
+                    );
+                if (g_color_selection == SELECTION_BW)
+                {
+                    memset(pict.data[1], 128, ((vp->width / 2) * (vp->height / 2)));
+                    memset(pict.data[2], 128, ((vp->width / 2) * (vp->height / 2)));
+
+                }
+                break;
+
         }
         SDL_UnlockYUVOverlay(vp->bmp);
         vp->pts = pts;
@@ -1017,6 +1065,24 @@ int video_thread(void *arg) {
     int frameFinished;
     AVFrame *pFrame;
     double pts;
+
+
+scale_thread_args_t *rgb_args =
+(scale_thread_args_t*)av_malloc(sizeof(scale_thread_args_t));
+scale_thread_args_t *yuv_args =
+(scale_thread_args_t*)av_malloc(sizeof(scale_thread_args_t));
+
+
+rgb_args->is = is;
+                rgb_args->my_queue = is->yuv_to_rgbq;
+                rgb_args->next_queue = is->rgb_to_yuvq;
+yuv_args->is = is;
+                yuv_args->my_queue = is->rgb_to_yuvq;
+                yuv_args->next_queue = is->yuv_to_displayq;
+
+
+    is->scale_to_rgb_tid = SDL_CreateThread(scale_thread, rgb_args );
+    is->scale_to_yuv_tid = SDL_CreateThread(scale_thread, yuv_args );
 
     pFrame = av_frame_alloc();
 
@@ -1135,6 +1201,10 @@ int stream_component_open(VideoState *is, int stream_index) {
             is->video_current_pts_time = av_gettime();
 
             packet_queue_init(&is->videoq);
+            packet_queue_init(&is->rgb_to_yuvq);
+            packet_queue_init(&is->yuv_to_rgbq);
+            packet_queue_init(&is->yuv_to_displayq);
+
             is->video_tid = SDL_CreateThread(video_thread, is);
             is->sws_ctx =
                 sws_getContext
@@ -1163,6 +1233,56 @@ int stream_component_open(VideoState *is, int stream_index) {
 
 int decode_interrupt_cb(void *opaque) {
     return (global_video_state && global_video_state->quit);
+}
+
+static int scale_thread(void *arg) {
+    ColorPacket *pkt;
+    AVPicture pict;
+    AVFrame new_frame;
+    scale_thread_args_t *thread_arg = (scale_thread_args_t*)arg;
+    VideoState *is = thread_arg->is;
+    int original_format = is->video_st->codec->pix_fmt;
+    for (;;)
+    {
+        if(packet_queue_get(&thread_arg.my_queue, pkt, 1) < 0) {
+            return -1;
+        }
+        AVFrame *pFrameRGB = av_frame_alloc();
+        struct SwsContext *sws_ctx = sws_getContext(
+                is->video_st->codec->width,
+                is->video_st->codec->height,
+                original_format,
+                is->video_st->codec->width,
+                is->video_st->codec->height,
+                pkt->dest_format,
+                SWS_PRINT_INFO,
+                NULL,
+                NULL,
+                NULL
+                );
+
+        int numBytes = avpicture_get_size(pkt->dest_format, is->video_st->codec->width,
+                is->video_st->codec->height);
+        uint8_t *buffer=(uint8_t *)av_malloc(numBytes*sizeof(uint8_t));
+
+        avpicture_fill((AVPicture *)&new_frame, buffer, pkt->dest_format,
+                is->video_st->codec->width, is->video_st->codec->height);
+
+        sws_scale
+            (
+             sws_ctx,
+             (uint8_t const * const *)pkt->frame->data,
+             pkt->frame->linesize,
+             0,
+             is->video_st->codec->height,
+             new_frame.data,
+             new_frame.linesize
+            );
+
+
+            av_free(buffer);
+
+    }
 }
 
 int decode_thread(void *arg) {
