@@ -40,6 +40,7 @@
 #endif
 #include <stdio.h>
 #include <math.h>
+#include <stdbool.h>
 
 #define SDL_AUDIO_BUFFER_SIZE 1024
 #define MAX_AUDIO_FRAME_SIZE 192000
@@ -112,6 +113,7 @@ typedef struct VideoState {
     SDL_cond        *pictq_cond;
     SDL_Thread      *parse_tid;
     SDL_Thread      *video_tid;
+    SDL_Thread      *display_tid;
 
     SDL_Thread      *scale_to_rgb_tid;
     SDL_Thread      *scale_to_yuv_tid;
@@ -166,14 +168,15 @@ typedef struct {
     selection_e selection;
     AVFrame *frame;
     AVPicture *pict;
-    int dest_format;
+    SDL_Overlay *bmp;
 } ColorPacket;
 
 typedef struct {
     VideoState *is;
     PacketQueue *my_queue;
     PacketQueue *next_queue;
-    scale_e scale;
+    int from_format;
+    int to_format;
 } scale_thread_args_t;
 
 SDL_Surface     *screen;
@@ -184,7 +187,8 @@ VideoState *global_video_state;
 AVPacket flush_pkt;
 
 static int scale_thread(void *arg);
-
+static int display_thread(void *arg);
+ 
 void packet_queue_init(PacketQueue *q) {
     memset(q, 0, sizeof(PacketQueue));
     q->mutex = SDL_CreateMutex();
@@ -900,8 +904,9 @@ void remove_color(VideoState *is, AVFrame *pFrame, AVPicture *pic,
 int queue_picture(VideoState *is, AVFrame *pFrame, double pts) {
 
     VideoPicture *vp;
+    bool queue_picture = true;
     //int dst_pix_fmt;
-    AVPicture pict;
+    AVPicture *pict = av_malloc(sizeof(AVPicture));
 
     /* wait until we have space for a new pic */
     SDL_LockMutex(is->pictq_mutex);
@@ -958,30 +963,48 @@ int queue_picture(VideoState *is, AVFrame *pFrame, double pts) {
         //dst_pix_fmt = PIX_FMT_YUV420P;
         /* point pict at the queue */
 
-        pict.data[0] = vp->bmp->pixels[0];
-        pict.data[1] = vp->bmp->pixels[2];
-        pict.data[2] = vp->bmp->pixels[1];
+        pict->data[0] = vp->bmp->pixels[0];
+        pict->data[1] = vp->bmp->pixels[2];
+        pict->data[2] = vp->bmp->pixels[1];
 
-        pict.linesize[0] = vp->bmp->pitches[0];
-        pict.linesize[1] = vp->bmp->pitches[2];
-        pict.linesize[2] = vp->bmp->pitches[1];
+        pict->linesize[0] = vp->bmp->pitches[0];
+        pict->linesize[1] = vp->bmp->pitches[2];
+        pict->linesize[2] = vp->bmp->pitches[1];
 
 AVPacket color_pkt;
+ColorPacket *pkt_data;
         switch (g_color_selection)
         {
             case SELECTION_BLUE:
-                remove_color(is, pFrame, &pict, g_color_selection);
+                remove_color(is, pFrame, pict, g_color_selection);
+
+        SDL_UnlockYUVOverlay(vp->bmp);
                 break;
 
             case SELECTION_RED:
             case SELECTION_GREEN:
-                packet_queue_init(&color_pkt);
-                ColorPacket *pkt_data = (ColorPacket*)av_malloc(sizeof(ColorPacket));
+//color_pkt=av_mallocz(sizeof(AVPacket));
+    //av_init_packet(&color_pkt);
+    av_new_packet(&color_pkt, sizeof(ColorPacket));
+                pkt_data = (ColorPacket*)av_mallocz(sizeof(ColorPacket));
                 pkt_data->selection = g_color_selection;
-                pkt_data->frame = pFrame;
+                pkt_data->bmp = vp->bmp;
+AVFrame *dup_frame = av_frame_alloc();
+//AVFrame *dup_frame = av_malloc(sizeof(AVFrame));
+int numBytes = avpicture_get_size(PIX_FMT_YUV420P, is->video_st->codec->width,
+            is->video_st->codec->height);
+    uint8_t *buffer=(uint8_t *)av_malloc(numBytes*sizeof(uint8_t));
+
+    avpicture_fill((AVPicture *)dup_frame, buffer, PIX_FMT_YUV420P,
+            is->video_st->codec->width, is->video_st->codec->height);
+
+
+                pkt_data->frame = dup_frame;
                                 pkt_data->pict = pict;
-                color_pkt.data = pkt_data;
-                packet_queue_put(&is->rgb_to_yuvq, &color_pkt);
+                memcpy(color_pkt.data, pkt_data, sizeof(ColorPacket));
+                //color_pkt.data = pkt_data;
+                packet_queue_put(&is->yuv_to_rgbq, &color_pkt);
+                queue_picture = false;
                 break;
 
 
@@ -995,21 +1018,23 @@ AVPacket color_pkt;
                      pFrame->linesize,
                      0,
                      is->video_st->codec->height,
-                     pict.data,
-                     pict.linesize
+                     pict->data,
+                     pict->linesize
                     );
                 if (g_color_selection == SELECTION_BW)
                 {
-                    memset(pict.data[1], 128, ((vp->width / 2) * (vp->height / 2)));
-                    memset(pict.data[2], 128, ((vp->width / 2) * (vp->height / 2)));
+                    memset(pict->data[1], 128, ((vp->width / 2) * (vp->height / 2)));
+                    memset(pict->data[2], 128, ((vp->width / 2) * (vp->height / 2)));
 
                 }
+        SDL_UnlockYUVOverlay(vp->bmp);
                 break;
 
         }
-        SDL_UnlockYUVOverlay(vp->bmp);
+        //SDL_UnlockYUVOverlay(vp->bmp);
         vp->pts = pts;
-
+if (queue_picture)
+{
         /* now we inform our display thread that we have a pic ready */
         if(++is->pictq_windex == VIDEO_PICTURE_QUEUE_SIZE) {
             is->pictq_windex = 0;
@@ -1018,6 +1043,7 @@ AVPacket color_pkt;
         SDL_LockMutex(is->pictq_mutex);
         is->pictq_size++;
         SDL_UnlockMutex(is->pictq_mutex);
+}
     }
 
     return 0;
@@ -1072,17 +1098,34 @@ scale_thread_args_t *rgb_args =
 scale_thread_args_t *yuv_args =
 (scale_thread_args_t*)av_malloc(sizeof(scale_thread_args_t));
 
+scale_thread_args_t *display_args = 
+(scale_thread_args_t*)av_malloc(sizeof(scale_thread_args_t));
+
+packet_queue_init(&is->rgb_to_yuvq);
+            packet_queue_init(&is->yuv_to_rgbq);
+            packet_queue_init(&is->yuv_to_displayq);
 
 rgb_args->is = is;
-                rgb_args->my_queue = is->yuv_to_rgbq;
-                rgb_args->next_queue = is->rgb_to_yuvq;
-yuv_args->is = is;
-                yuv_args->my_queue = is->rgb_to_yuvq;
-                yuv_args->next_queue = is->yuv_to_displayq;
+                rgb_args->my_queue = &is->yuv_to_rgbq;
+                rgb_args->next_queue = &is->rgb_to_yuvq;
+rgb_args->from_format = PIX_FMT_YUV420P;
+rgb_args->to_format = PIX_FMT_RGB24;
 
+yuv_args->is = is;
+                yuv_args->my_queue = &is->rgb_to_yuvq;
+                yuv_args->next_queue = &is->yuv_to_displayq;
+yuv_args->from_format = PIX_FMT_RGB24;
+yuv_args->to_format = PIX_FMT_YUV420P;
+
+
+display_args->is = is;
+display_args->my_queue = &is->yuv_to_displayq;
+
+                display_args->next_queue = NULL;
 
     is->scale_to_rgb_tid = SDL_CreateThread(scale_thread, rgb_args );
     is->scale_to_yuv_tid = SDL_CreateThread(scale_thread, yuv_args );
+    is->display_tid = SDL_CreateThread(display_thread, display_args );
 
     pFrame = av_frame_alloc();
 
@@ -1201,10 +1244,7 @@ int stream_component_open(VideoState *is, int stream_index) {
             is->video_current_pts_time = av_gettime();
 
             packet_queue_init(&is->videoq);
-            packet_queue_init(&is->rgb_to_yuvq);
-            packet_queue_init(&is->yuv_to_rgbq);
-            packet_queue_init(&is->yuv_to_displayq);
-
+            
             is->video_tid = SDL_CreateThread(video_thread, is);
             is->sws_ctx =
                 sws_getContext
@@ -1235,53 +1275,92 @@ int decode_interrupt_cb(void *opaque) {
     return (global_video_state && global_video_state->quit);
 }
 
+static int display_thread(void *arg) {
+scale_thread_args_t *thread_arg = (scale_thread_args_t*)arg;
+AVPacket packet;
+    VideoPicture *vp;
+VideoState *is = thread_arg->is;
+// windex is set to 0 initially
+    vp = &is->pictq[is->pictq_windex];
+
+
+ for (;;)
+    {
+        if(packet_queue_get(thread_arg->my_queue, &packet, 1) < 0) {
+            return -1;
+        }
+
+    ColorPacket *pkt_data = packet.data;
+    //printf( "got pkt in display");
+AVPicture *temp = (AVPicture*)pkt_data->frame;
+    //memcpy(pkt_data->pict, pkt_data->frame, sizeof(AVPicture));
+    memcpy(pkt_data->pict->data[0], temp->data[0], pkt_data->pict->linesize[0]);
+   memcpy(pkt_data->pict->data[1], temp->data[1], pkt_data->pict->linesize[1]);
+    memcpy(pkt_data->pict->data[2], temp->data[2], pkt_data->pict->linesize[2]);
+       SDL_UnlockYUVOverlay(vp->bmp);
+}
+}
+
 static int scale_thread(void *arg) {
-    ColorPacket *pkt;
+    AVPacket packet;
     AVPicture pict;
-    AVFrame new_frame;
     scale_thread_args_t *thread_arg = (scale_thread_args_t*)arg;
     VideoState *is = thread_arg->is;
     int original_format = is->video_st->codec->pix_fmt;
     for (;;)
     {
-        if(packet_queue_get(&thread_arg.my_queue, pkt, 1) < 0) {
+        if(packet_queue_get(thread_arg->my_queue, &packet, 1) < 0) {
             return -1;
         }
-        AVFrame *pFrameRGB = av_frame_alloc();
+    ColorPacket *pkt_data = packet.data;
+//printf("got pkt in thread to %d\n", thread_arg->to_format);
+
         struct SwsContext *sws_ctx = sws_getContext(
                 is->video_st->codec->width,
                 is->video_st->codec->height,
-                original_format,
+                thread_arg->from_format,
                 is->video_st->codec->width,
                 is->video_st->codec->height,
-                pkt->dest_format,
-                SWS_PRINT_INFO,
+                thread_arg->to_format,
+                SWS_BILINEAR,
                 NULL,
                 NULL,
                 NULL
                 );
 
-        int numBytes = avpicture_get_size(pkt->dest_format, is->video_st->codec->width,
+        AVFrame *new_frame = av_frame_alloc();
+        int numBytes = avpicture_get_size(thread_arg->to_format,
+ is->video_st->codec->width,
                 is->video_st->codec->height);
         uint8_t *buffer=(uint8_t *)av_malloc(numBytes*sizeof(uint8_t));
 
-        avpicture_fill((AVPicture *)&new_frame, buffer, pkt->dest_format,
+        avpicture_fill((AVPicture *)new_frame, buffer, thread_arg->to_format,
                 is->video_st->codec->width, is->video_st->codec->height);
 
         sws_scale
             (
              sws_ctx,
-             (uint8_t const * const *)pkt->frame->data,
-             pkt->frame->linesize,
+             (uint8_t const * const *)pkt_data->frame->data,
+             pkt_data->frame->linesize,
              0,
              is->video_st->codec->height,
-             new_frame.data,
-             new_frame.linesize
+             new_frame->data,
+             new_frame->linesize
             );
 
 
-            av_free(buffer);
+        av_free(buffer);
 
+//printf("putting pkt in thread %d\n", thread_arg->to_format);
+        AVPacket new_packet;
+        av_new_packet(&new_packet, sizeof(ColorPacket));
+    pkt_data->frame = new_frame;
+        memcpy(new_packet.data, pkt_data, sizeof(ColorPacket));
+        packet_queue_put(thread_arg->next_queue, &new_packet);
+
+        //av_free(pkt_data->pict);
+        //av_frame_free(pkt_data->frame);
+        av_free(pkt_data->frame);
     }
 }
 
@@ -1573,13 +1652,19 @@ int main(int argc, char *argv[]) {
                 switch(event.key.keysym.sym) {
                     case SDLK_w:
                         g_color_selection = SELECTION_BW;
-                    break;
+                        break;
                     case SDLK_c:
                         g_color_selection = SELECTION_COLOR;
-                    break;
+                        break;
                     case SDLK_b:
                         g_color_selection = SELECTION_BLUE;
-                    break;
+                        break;
+                    case SDLK_r:
+                        g_color_selection = SELECTION_RED;
+                        break;
+                    case SDLK_g:
+                        g_color_selection = SELECTION_GREEN;
+                        break;
                     case SDLK_LEFT:
                         incr = -10.0;
                         goto do_seek;
