@@ -160,6 +160,7 @@ typedef enum {
 }scale_e;
 
 selection_e g_color_selection = SELECTION_NONE;
+bool g_save = false;
 
 typedef struct {
     selection_e selection;
@@ -186,7 +187,7 @@ SDL_Surface     *screen;
 /* Since we only have one decoding thread, the Big Struct
    can be global in case we need it. */
 VideoState *global_video_state;
-int transform_count = 0;
+//int transform_count = 0;
 AVPacket flush_pkt;
 
 static int scale_thread(void *arg);
@@ -705,6 +706,28 @@ void video_display(VideoState *is) {
     }
 }
 
+void SaveFrame(AVFrame *pFrame, int width, int height, int iFrame) {
+  FILE *pFile;
+  char szFilename[32];
+  int  y;
+  
+  // Open file
+  sprintf(szFilename, "frame%d.ppm", iFrame);
+  pFile=fopen(szFilename, "wb");
+  if(pFile==NULL)
+    return;
+  
+  // Write header
+  fprintf(pFile, "P6\n%d %d\n255\n", width, height);
+  
+  // Write pixel data
+  for(y=0; y<height; y++)
+    fwrite(pFrame->data[0]+y*pFrame->linesize[0], 1, width*3, pFile);
+  
+  // Close file
+  fclose(pFile);
+}
+
 void video_refresh_timer(void *userdata) {
 
     VideoState *is = (VideoState *)userdata;
@@ -718,11 +741,11 @@ void video_refresh_timer(void *userdata) {
             vp = &is->pictq[is->pictq_rindex];
 
             if (!vp->ready)
-{
-printf("refreshhhh\n");
-    schedule_refresh(is, 1);
-    return;
-}
+            {
+                printf("refreshhhh\n");
+                schedule_refresh(is, 1);
+                return;
+            }
 
             is->video_current_pts = vp->pts;
             is->video_current_pts_time = av_gettime();
@@ -771,6 +794,27 @@ printf("refreshhhh\n");
             /* show the picture! */
             video_display(is);
             vp->ready = false;
+
+
+            /* Is save needed? */
+            if(g_save)
+            {
+                AVPicture *temp_picture = av_mallocz(sizeof(AVPicture));
+                temp_picture->data[0] = vp->bmp->pixels[0];
+                temp_picture->data[1] = vp->bmp->pixels[2];
+                temp_picture->data[2] = vp->bmp->pixels[1];
+
+                temp_picture->linesize[0] = vp->bmp->pitches[0];
+                temp_picture->linesize[1] = vp->bmp->pitches[2];
+                temp_picture->linesize[2] = vp->bmp->pitches[1];
+
+
+                SaveFrame((AVFrame*)temp_picture, is->video_st->codec->width,
+                        is->video_st->codec->height, 1);
+
+                av_free(temp_picture);
+                g_save = false;
+            }
             /* update queue for next picture! */
             if(++is->pictq_rindex == VIDEO_PICTURE_QUEUE_SIZE) {
                 is->pictq_rindex = 0;
@@ -926,7 +970,7 @@ static int transform_to_color_thread(void *args) {
              pkt_data->selection);
 
         SDL_UnlockYUVOverlay(vp->bmp);
-        transform_count--;
+        //transform_count--;
         vp->ready = true;
     }
 }
@@ -1005,7 +1049,7 @@ int queue_picture(VideoState *is, AVFrame *pFrame, double pts) {
         switch (g_color_selection)
         {
             case SELECTION_BLUE:
-                while (transform_count > 0);
+                //while (transform_count > 0);
                 remove_color(is, pFrame, pict, g_color_selection);
                 break;
 
@@ -1019,13 +1063,13 @@ int queue_picture(VideoState *is, AVFrame *pFrame, double pts) {
                 memcpy(color_pkt.data, &pkt_data, sizeof(ColorPacket));
                 packet_queue_put(&is->transformq, &color_pkt);
                 picture_ready = false;
-                transform_count++;
+                //transform_count++;
                 break;
 
             case SELECTION_BW:
             default:
 
-                while (transform_count > 0);
+                //while (transform_count > 0);
                 // Convert the image into YUV format that SDL uses
                 sws_scale
                     (
@@ -1563,6 +1607,15 @@ int main(int argc, char *argv[]) {
                         break;
                     case SDLK_g:
                         g_color_selection = SELECTION_GREEN;
+                        break;
+                    case SDLK_m:
+                        SDL_PauseAudio(1);
+                        break;
+                    case SDLK_v:
+                        SDL_PauseAudio(0);
+                        break;
+                    case SDLK_p:
+                        g_save = true;
                         break;
                     case SDLK_LEFT:
                         incr = -10.0;
