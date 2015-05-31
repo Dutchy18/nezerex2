@@ -162,6 +162,12 @@ typedef enum {
 selection_e g_color_selection = SELECTION_NONE;
 bool g_save = false;
 
+//PacketQueue *current_audio_queue = NULL;
+VideoState *g_video_playing_video_state = NULL;
+VideoState *g_audio_playing_video_state = NULL;
+
+bool g_audio_dev_open = false;
+
 typedef struct {
     selection_e selection;
     AVFrame *frame;
@@ -183,6 +189,13 @@ typedef struct {
 }transform_thread_args_t;
 
 SDL_Surface     *screen;
+
+SDL_mutex *g_video_decode_mutex;
+
+VideoState      *g_is_one;
+VideoState      *g_is_two;
+VideoState      *g_is_three;
+
 
 /* Since we only have one decoding thread, the Big Struct
    can be global in case we need it. */
@@ -497,6 +510,67 @@ long audio_tutorial_resample(VideoState *is, struct AVFrame *inframe) {
 #endif
 }
 
+void audio_decode_fetch_not_active_audio_packets(void *args) {
+
+while(1)
+{
+    if(g_audio_playing_video_state == g_is_one)
+    {
+        AVPacket *pkt2 = &g_is_two->audio_pkt;
+        AVPacket *pkt3 = &g_is_three->audio_pkt;
+        packet_queue_get(&g_is_two->audioq, pkt2, 0);
+        packet_queue_get(&g_is_three->audioq, pkt3, 0);
+    }
+    else if(g_audio_playing_video_state == g_is_two)
+    {
+
+        AVPacket *pkt1 = &g_is_one->audio_pkt;
+        AVPacket *pkt3 = &g_is_three->audio_pkt;
+        packet_queue_get(&g_is_one->audioq, pkt1, 0);
+        packet_queue_get(&g_is_three->audioq, pkt3, 0);
+    }
+    else
+    {
+
+        AVPacket *pkt1 = &g_is_one->audio_pkt;
+        AVPacket *pkt2 = &g_is_two->audio_pkt;
+        packet_queue_get(&g_is_one->audioq, pkt1, 0);
+        packet_queue_get(&g_is_two->audioq, pkt2, 0);
+    }
+SDL_Delay(50);
+}
+}
+void video_decode_fetch_not_active_video_packets(void *args) {
+while(1)
+{
+    if(g_video_playing_video_state == g_is_one)
+    {
+        AVPacket pkt2;
+        AVPacket pkt3;
+        packet_queue_get(&g_is_two->videoq, &pkt2, 0);
+        packet_queue_get(&g_is_three->videoq, &pkt3, 0);
+    }
+    else if(g_video_playing_video_state == g_is_two)
+    {
+
+        AVPacket pkt1;
+        AVPacket pkt3;
+        packet_queue_get(&g_is_one->videoq, &pkt1, 0);
+        packet_queue_get(&g_is_three->videoq, &pkt3, 0);
+    }
+    else
+    {
+
+        AVPacket pkt1;
+        AVPacket pkt2;
+        packet_queue_get(&g_is_one->videoq, &pkt1, 0);
+        packet_queue_get(&g_is_two->videoq, &pkt2, 0);
+    }
+SDL_Delay(50);
+}
+}
+
+
 int audio_decode_frame(VideoState *is, double *pts_ptr) {
     /* For example with wma audio package size can be
        like 100 000 bytes */
@@ -542,7 +616,6 @@ int audio_decode_frame(VideoState *is, double *pts_ptr) {
 
                 } else {
 #endif
-
                     memcpy(is->audio_buf, is->audio_frame.data[0], data_size);
 #ifdef __RESAMPLER__
                 }
@@ -593,7 +666,7 @@ int audio_decode_frame(VideoState *is, double *pts_ptr) {
         }
 
         /* next packet */
-        if(packet_queue_get(&is->audioq, pkt, 1) < 0) {
+          if(packet_queue_get(&is->audioq, pkt, 1) < 0) {
             return -1;
         }
 
@@ -614,7 +687,7 @@ int audio_decode_frame(VideoState *is, double *pts_ptr) {
 
 void audio_callback(void *userdata, Uint8 *stream, int len) {
 
-    VideoState *is = (VideoState *)userdata;
+    VideoState *is = (VideoState *)g_audio_playing_video_state;
     int len1, audio_size;
     double pts;
 
@@ -622,6 +695,7 @@ void audio_callback(void *userdata, Uint8 *stream, int len) {
         if(is->audio_buf_index >= is->audio_buf_size) {
             /* We have already sent all our data; get more */
             audio_size = audio_decode_frame(is, &pts);
+
 
             if(audio_size < 0) {
                 /* If error, output silence */
@@ -642,7 +716,6 @@ void audio_callback(void *userdata, Uint8 *stream, int len) {
         if(len1 > len) {
             len1 = len;
         }
-
         memcpy(stream, (uint8_t *)is->audio_buf + is->audio_buf_index, len1);
         len -= len1;
         stream += len1;
@@ -792,7 +865,10 @@ void video_refresh_timer(void *userdata) {
             schedule_refresh(is, (int)(actual_delay * 1000 + 0.5));
 
             /* show the picture! */
-            video_display(is);
+            if(is == g_video_playing_video_state)
+            {
+                video_display(is);
+            }
             vp->ready = false;
 
 
@@ -899,7 +975,6 @@ void remove_color(VideoState *is, AVFrame *pFrame, AVPicture *pic,
     int width = is->video_st->codec->width;
     int count = 0;
     uint8_t *data_ptr = pFrameRGB->data[0];
-    int start_point = 0;
 
     uint8_t *frame_ptr;
     for (int i = 0; i< height; i++)
@@ -1223,7 +1298,7 @@ int stream_component_open(VideoState *is, int stream_index) {
     // Get a pointer to the codec context for the video stream
     codecCtx = pFormatCtx->streams[stream_index]->codec;
 
-    if(codecCtx->codec_type == AVMEDIA_TYPE_AUDIO) {
+    if(codecCtx->codec_type == AVMEDIA_TYPE_AUDIO && !g_audio_dev_open) {
         // Set audio settings from codec info
         wanted_spec.freq = codecCtx->sample_rate;
         wanted_spec.format = AUDIO_S16SYS;
@@ -1239,6 +1314,8 @@ int stream_component_open(VideoState *is, int stream_index) {
         }
 
         is->audio_hw_buf_size = spec.size;
+
+    g_audio_dev_open = true;
     }
 
     codec = avcodec_find_decoder(codecCtx->codec_id);
@@ -1264,6 +1341,7 @@ int stream_component_open(VideoState *is, int stream_index) {
             memset(&is->audio_pkt, 0, sizeof(is->audio_pkt));
             packet_queue_init(&is->audioq);
             SDL_PauseAudio(0);
+
             break;
 
         case AVMEDIA_TYPE_VIDEO:
@@ -1328,6 +1406,7 @@ int decode_thread(void *arg) {
     // will interrupt blocking functions if we quit!
     callback.callback = decode_interrupt_cb;
     callback.opaque = is;
+       SDL_LockMutex(g_video_decode_mutex);
 
     if(avio_open2(&is->io_context, is->filename, 0, &callback, &io_dict)) {
         fprintf(stderr, "Unable to open I/O for %s\n", is->filename);
@@ -1442,7 +1521,7 @@ int decode_thread(void *arg) {
 #endif
 
     // main decode loop
-
+        SDL_UnlockMutex(g_video_decode_mutex);
     for(;;) {
         if(is->quit) {
             break;
@@ -1491,6 +1570,7 @@ int decode_thread(void *arg) {
         if(av_read_frame(is->pFormatCtx, packet) < 0) {
             if(is->pFormatCtx->pb->error == 0) {
                 SDL_Delay(100); /* no error; wait for user input */
+
                 continue;
 
             } else {
@@ -1508,6 +1588,7 @@ int decode_thread(void *arg) {
         } else {
             av_free_packet(packet);
         }
+
     }
 
     /* all done - wait for it */
@@ -1533,13 +1614,32 @@ void stream_seek(VideoState *is, int64_t pos, int rel) {
     }
 }
 
+int video_state_init(VideoState *is, const char *filename)
+{
+    av_strlcpy(is->filename, filename, 1024);
+
+    is->pictq_mutex = SDL_CreateMutex();
+    is->pictq_cond = SDL_CreateCond();
+
+    schedule_refresh(is, 40);
+
+    is->av_sync_type = DEFAULT_AV_SYNC_TYPE;
+    is->parse_tid = SDL_CreateThread(decode_thread, is);
+
+    if(!is->parse_tid) {
+        av_free(is);
+        return -1;
+    }
+    return 0;
+}
+
 int main(int argc, char *argv[]) {
 
     SDL_Event       event;
     //double          pts;
-    VideoState      *is;
-
-    is = av_mallocz(sizeof(VideoState));
+        g_is_one = av_mallocz(sizeof(VideoState));
+    g_is_two = av_mallocz(sizeof(VideoState));
+    g_is_three = av_mallocz(sizeof(VideoState));
 //TODO: debug
     /*if(argc < 2) {
         fprintf(stderr, "Usage: test <file>\n");
@@ -1568,21 +1668,28 @@ int main(int argc, char *argv[]) {
         exit(1);
     }
 
-    av_strlcpy(is->filename, "here.mp4"/*argv[1]*/, 1024);
+    g_video_decode_mutex = SDL_CreateMutex();
 
-    is->pictq_mutex = SDL_CreateMutex();
-    is->pictq_cond = SDL_CreateCond();
-
-    schedule_refresh(is, 40);
-
-    is->av_sync_type = DEFAULT_AV_SYNC_TYPE;
-    is->parse_tid = SDL_CreateThread(decode_thread, is);
-
-    if(!is->parse_tid) {
-        av_free(is);
+    if(video_state_init(g_is_one, "one.mp4") < 0)
+    {
         return -1;
     }
 
+    if(video_state_init(g_is_two, "two.flv") < 0)
+    {
+        return -1;
+    }
+
+    if(video_state_init(g_is_three, "three.flv") < 0)
+    {
+        return -1;
+    }
+
+    g_video_playing_video_state = g_is_one;
+    g_audio_playing_video_state = g_is_one;
+
+SDL_CreateThread(audio_decode_fetch_not_active_audio_packets, NULL);
+SDL_CreateThread(video_decode_fetch_not_active_video_packets, NULL);
     av_init_packet(&flush_pkt);
     flush_pkt.data = (unsigned char *)"FLUSH";
 
@@ -1612,12 +1719,55 @@ int main(int argc, char *argv[]) {
                         SDL_PauseAudio(1);
                         break;
                     case SDLK_v:
-                        packet_queue_flush(&is->audioq);
+                        packet_queue_flush(&g_audio_playing_video_state->audioq);
                         SDL_PauseAudio(0);
                         break;
                     case SDLK_p:
                         g_save = true;
                         break;
+                    case SDLK_1:
+                        g_audio_playing_video_state = g_is_one;
+                        break;
+                    case SDLK_2:
+                        g_audio_playing_video_state = g_is_two;
+                        break;
+                    case SDLK_3:
+                        g_audio_playing_video_state = g_is_three;
+                        break;
+                    case SDLK_4:
+                        g_video_playing_video_state = g_is_one;
+                        break;
+                    case SDLK_5:
+                        g_video_playing_video_state = g_is_two;
+                        break;
+                    case SDLK_6:
+                        g_video_playing_video_state = g_is_three;
+                        break;
+                    case SDLK_7:
+                        g_audio_playing_video_state = g_is_one;
+                        g_video_playing_video_state = g_is_one;
+
+                        packet_queue_flush(&g_is_one->audioq);
+                        packet_queue_flush(&g_is_two->audioq);
+                        packet_queue_flush(&g_is_three->audioq);
+                        break;
+                    case SDLK_8:
+                        g_audio_playing_video_state = g_is_two;
+                        g_video_playing_video_state = g_is_two;
+packet_queue_flush(&g_is_one->audioq);
+                        packet_queue_flush(&g_is_two->audioq);
+                        packet_queue_flush(&g_is_three->audioq);
+                        
+                        break;
+                    case SDLK_9:
+                        g_audio_playing_video_state = g_is_three;
+                        g_video_playing_video_state = g_is_three;
+packet_queue_flush(&g_is_one->audioq);
+                        packet_queue_flush(&g_is_two->audioq);
+                        packet_queue_flush(&g_is_three->audioq);
+                        
+                        break;
+
                     case SDLK_LEFT:
                         incr = -10.0;
                         goto do_seek;
@@ -1651,14 +1801,14 @@ do_seek:
 
             case FF_QUIT_EVENT:
             case SDL_QUIT:
-                is->quit = 1;
+                g_video_playing_video_state->quit = 1;
                 /*
                  * If the video has finished playing, then both the picture and
                  * audio queues are waiting for more data.  Make them stop
                  * waiting and terminate normally.
                  */
-                SDL_CondSignal(is->audioq.cond);
-                SDL_CondSignal(is->videoq.cond);
+                SDL_CondSignal(g_video_playing_video_state->audioq.cond);
+                SDL_CondSignal(g_video_playing_video_state->videoq.cond);
                 SDL_Quit();
                 exit(0);
                 break;
