@@ -114,15 +114,8 @@ typedef struct VideoState {
     SDL_cond        *pictq_cond;
     SDL_Thread      *parse_tid;
     SDL_Thread      *video_tid;
-    //SDL_Thread      *display_tid;
     SDL_Thread      *transform_tid;
 
-    //SDL_Thread      *scale_to_rgb_tid;
-    //SDL_Thread      *scale_to_yuv_tid;
-
-    //PacketQueue     yuv_to_rgbq;
-    //PacketQueue     rgb_to_yuvq;
-    //PacketQueue     yuv_to_displayq;
     PacketQueue       transformq;
     char            filename[1024];
     int             quit;
@@ -674,10 +667,8 @@ void video_display(VideoState *is) {
 
     SDL_Rect rect;
     VideoPicture *vp;
-    //AVPicture pict;
     float aspect_ratio;
     int w, h, x, y;
-    //int i;
 
     vp = &is->pictq[is->pictq_rindex];
 
@@ -779,7 +770,7 @@ printf("refreshhhh\n");
 
             /* show the picture! */
             video_display(is);
-vp->ready = false;
+            vp->ready = false;
             /* update queue for next picture! */
             if(++is->pictq_rindex == VIDEO_PICTURE_QUEUE_SIZE) {
                 is->pictq_rindex = 0;
@@ -792,7 +783,6 @@ vp->ready = false;
         }
 
     } else {
-    printf("no video st\n");
         schedule_refresh(is, 100);
     }
 }
@@ -887,6 +877,7 @@ void remove_color(VideoState *is, AVFrame *pFrame, AVPicture *pic,
                 *frame_ptr = 0;
         }
     }
+
     struct SwsContext *sws_ctx2 = sws_getContext(
             is->video_st->codec->width,
             is->video_st->codec->height,
@@ -899,7 +890,6 @@ void remove_color(VideoState *is, AVFrame *pFrame, AVPicture *pic,
             NULL,
             NULL
             );
-
 
     sws_scale
         (
@@ -914,7 +904,6 @@ void remove_color(VideoState *is, AVFrame *pFrame, AVPicture *pic,
 
     av_free(buffer);
     av_free(pFrameRGB);
-
 }
 
 static int transform_to_color_thread(void *args) {
@@ -1054,7 +1043,6 @@ int queue_picture(VideoState *is, AVFrame *pFrame, double pts) {
                     memset(pict->data[2], 128, ((vp->width / 2) * (vp->height / 2)));
 
                 }
-                //SDL_UnlockYUVOverlay(vp->bmp);
                 break;
 
         }
@@ -1124,10 +1112,7 @@ int video_thread(void *arg) {
     double pts;
 
 
-packet_queue_init(&is->transformq);
-    //is->scale_to_rgb_tid = SDL_CreateThread(scale_thread, rgb_args );
-    //is->scale_to_yuv_tid = SDL_CreateThread(scale_thread, yuv_args );
-    //is->display_tid = SDL_CreateThread(display_thread, display_args );
+    packet_queue_init(&is->transformq);
     is->transform_tid = SDL_CreateThread(transform_to_color_thread, is);
 
     for(;;) {
@@ -1246,8 +1231,8 @@ int stream_component_open(VideoState *is, int stream_index) {
             is->video_current_pts_time = av_gettime();
 
             packet_queue_init(&is->videoq);
-            
             is->video_tid = SDL_CreateThread(video_thread, is);
+
             is->sws_ctx =
                 sws_getContext
                 (
