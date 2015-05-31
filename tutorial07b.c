@@ -1540,7 +1540,7 @@ int main(int argc, char *argv[]) {
     VideoState      *is;
 
     is = av_mallocz(sizeof(VideoState));
-
+//TODO: debug
     /*if(argc < 2) {
         fprintf(stderr, "Usage: test <file>\n");
         exit(1);
@@ -1612,6 +1612,7 @@ int main(int argc, char *argv[]) {
                         SDL_PauseAudio(1);
                         break;
                     case SDLK_v:
+                        packet_queue_flush(&is->audioq);
                         SDL_PauseAudio(0);
                         break;
                     case SDLK_p:
